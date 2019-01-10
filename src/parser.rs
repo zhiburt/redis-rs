@@ -7,15 +7,18 @@ use crate::types::{make_extension_error, ErrorKind, RedisError, RedisResult, Val
 
 use combine::{
     any,
-    error::StreamError,
-    opaque,
+    error::{Commit, StreamError},
+    parser,
     parser::{
         byte::{crlf, take_until_bytes},
         combinator::{any_send_sync_partial_state, AnySendSyncPartialState},
+        function,
         range::{recognize, take},
     },
-    stream::{PointerOffset, RangeStream, StreamErrorFor},
-    ParseError, Parser as _,
+    stream::{
+        state::Stream as StateStream, PointerOffset, RangeStream, StreamErrorFor, StreamOnce,
+    },
+    ParseError,
 };
 
 struct ResultExtend<T, E>(Result<T, E>);
@@ -53,69 +56,171 @@ where
     }
 }
 
-fn value<'a, I>(
-) -> impl combine::Parser<I, Output = RedisResult<Value>, PartialState = AnySendSyncPartialState>
-where
-    I: RangeStream<Token = u8, Range = &'a [u8]>,
-    I::Error: combine::ParseError<u8, &'a [u8], I::Position>,
+trait RedisParser: Send {
+    fn nil(&mut self) -> RedisResult<()>;
+    fn data(&mut self, data: &[u8]) -> RedisResult<()>;
+    fn status(&mut self, msg: &str) -> RedisResult<()>;
+    fn bulk_start(&mut self, size: usize);
+    fn bulk_end(&mut self);
+    fn int(&mut self, i: i64) -> RedisResult<()>;
+}
+
+enum ValueParser {
+    Bulk(Vec<Vec<Value>>),
+    Value(Value),
+}
+
+impl Default for ValueParser {
+    fn default() -> Self {
+        ValueParser::Value(Value::Nil)
+    }
+}
+
+impl ValueParser {
+    fn take(&mut self) -> Value {
+        let value = ::std::mem::replace(self, ValueParser::default());
+        match value {
+            ValueParser::Value(v) => v,
+            ValueParser::Bulk(_) => unreachable!(),
+        }
+    }
+
+    fn value(&mut self, value: Value) -> RedisResult<()> {
+        match self {
+            ValueParser::Value(_) => *self = ValueParser::Value(value),
+            ValueParser::Bulk(bulk) => bulk.last_mut().unwrap().push(value),
+        }
+        Ok(())
+    }
+}
+
+impl RedisParser for ValueParser {
+    fn nil(&mut self) -> RedisResult<()> {
+        self.value(Value::Nil)
+    }
+    fn data(&mut self, data: &[u8]) -> RedisResult<()> {
+        self.value(Value::Data(data.to_owned()))
+    }
+    fn status(&mut self, msg: &str) -> RedisResult<()> {
+        self.value(if msg == "OK" {
+            Value::Okay
+        } else {
+            Value::Status(msg.to_owned())
+        })
+    }
+    fn bulk_start(&mut self, size: usize) {
+        let bulks = match self {
+            ValueParser::Value(_) => {
+                *self = ValueParser::Bulk(vec![]);
+                match self {
+                    ValueParser::Value(_) => unreachable!(),
+                    ValueParser::Bulk(bulks) => bulks,
+                }
+            }
+            ValueParser::Bulk(bulks) => bulks,
+        };
+        bulks.push(Vec::with_capacity(size));
+    }
+    fn bulk_end(&mut self) {
+        *self = match self {
+            ValueParser::Value(_) => unreachable!(),
+            ValueParser::Bulk(bulks) => {
+                let done_bulk = bulks.pop().unwrap();
+                match bulks.last_mut() {
+                    Some(bulk) => {
+                        bulk.push(Value::Bulk(done_bulk));
+                        return;
+                    }
+                    None => ValueParser::Value(Value::Bulk(done_bulk)),
+                }
+            }
+        }
+    }
+    fn int(&mut self, i: i64) -> RedisResult<()> {
+        self.value(Value::Int(i))
+    }
+}
+
+parser! {
+fn with_state[S, R, I, F](f: F)(StateStream<I, S>) -> R
+    where [
+        F: FnMut(&mut S) -> R,
+        I: combine::Stream
+    ]
 {
-    opaque!(any_send_sync_partial_state(any().then_partial(
-        move |&mut b| {
-            let line = || {
-                recognize(take_until_bytes(&b"\r\n"[..]).with(take(2).map(|_| ()))).and_then(
-                    |line: &[u8]| {
-                        str::from_utf8(&line[..line.len() - 2]).map_err(StreamErrorFor::<I>::other)
-                    },
-                )
-            };
+    function::parser(move |input: &mut StateStream<I, S>| -> Result<_, _> {
+        Ok((f(&mut input.state), Commit::Peek(())))
+    })
+}
+}
 
-            let status = || {
-                line().map(|line| {
-                    if line == "OK" {
-                        Value::Okay
-                    } else {
-                        Value::Status(line.into())
-                    }
-                })
-            };
+parser! {
+type PartialState = AnySendSyncPartialState;
+fn value['a, 'b, I]()(StateStream<I, &'b mut dyn RedisParser>) -> RedisResult<()>
+    where [I: RangeStream<Token = u8, Range = &'a [u8]>,
+           I::Error: combine::ParseError<u8, &'a [u8], I::Position>,
+           StateStream<I, &'b mut dyn RedisParser>: RangeStream<Token = u8, Range = &'a [u8]>,
+           <StateStream<I, &'b mut dyn RedisParser> as StreamOnce>::Token: PartialEq + Send,
+           <StateStream<I, &'b mut dyn RedisParser> as StreamOnce>::Range: combine::stream::Range + PartialEq + Send,
+           <StateStream<I, &'b mut dyn RedisParser> as StreamOnce>::Error: combine::ParseError<u8, &'a [u8], <StateStream<I, &'b mut dyn RedisParser> as StreamOnce>::Position>,
+           <<StateStream<I, &'b mut dyn RedisParser> as StreamOnce>::Error as combine::ParseError<u8, &'a [u8], <StateStream<I, &'b mut dyn RedisParser> as StreamOnce>::Position>>::StreamError: StreamError<u8, &'a [u8]>,
+          ]
+{
+        any_send_sync_partial_state(any().then_partial(move |&mut b| {
+        let line = || recognize(take_until_bytes(&b"\r\n"[..]).with(take(2).map(|_| ())))
+            .and_then(|line: &[u8]| {
+                str::from_utf8(&line[..line.len() - 2])
+                    .map_err(StreamErrorFor::<StateStream<I, _>>::other)
+            });
 
-            let int = || {
-                line().and_then(|line| match line.trim().parse::<i64>() {
-                    Err(_) => Err(StreamErrorFor::<I>::message_static_message(
-                        "Expected integer, got garbage",
-                    )),
-                    Ok(value) => Ok(value),
-                })
-            };
+        let status = || line().map_input(move |line, input: &mut StateStream<_, &mut dyn RedisParser>| {
+            input.state.status(line)
+        });
 
-            let data = || {
-                int().then_partial(move |size| {
-                    if *size < 0 {
-                        combine::value(Value::Nil).left()
-                    } else {
-                        take(*size as usize)
-                            .map(|bs: &[u8]| Value::Data(bs.to_vec()))
-                            .skip(crlf())
-                            .right()
-                    }
-                })
-            };
+        let int = || line().and_then(move |line| {
+            match line.trim().parse::<i64>() {
+                Err(_) => Err(StreamErrorFor::<StateStream<I, _>>::message_static_message("Expected integer, got garbage")),
+                Ok(value) => Ok(value),
+            }
+        });
 
-            let bulk = || {
-                int().then_partial(|&mut length| {
-                    if length < 0 {
-                        combine::value(Value::Nil).map(Ok).left()
-                    } else {
-                        let length = length as usize;
-                        combine::count_min_max(length, length, value())
-                            .map(|result: ResultExtend<_, _>| result.0.map(Value::Bulk))
-                            .right()
-                    }
-                })
-            };
+        let data = || int().then_partial(move |&mut size| {
+            if size < 0 {
+                with_state(move |state: &mut &mut dyn RedisParser| state.nil())
+                    .left()
+            } else {
+                take(size as usize)
+                    .map_input(move |bs: &[u8], input: &mut StateStream<_, &mut dyn RedisParser>|
+                        input.state.data(bs)
+                    )
+                    .skip(crlf())
+                    .right()
+            }
+        });
 
-            let error = || {
-                line().map(|line: &str| {
+        let bulk = || {
+            int().then_partial(move |&mut length| {
+                if length < 0 {
+                    with_state(move |state: &mut &mut dyn RedisParser|
+                        state.nil()
+                    )
+                        .left()
+                } else {
+                    let length = length as usize;
+                    with_state(move |state: &mut &mut dyn RedisParser| state.bulk_start(length))
+                        .with(combine::count_min_max(length, length, value()))
+                        .skip(with_state(|state: &mut &mut dyn RedisParser| state.bulk_end()))
+                        .map(|result: ResultExtend<(), _>| {
+                            result.0
+                        })
+                        .right()
+                }
+            })
+        };
+
+        let error = || {
+            line()
+                .map(move |line: &str| {
                     let desc = "An error was signalled by the server";
                     let mut pieces = line.splitn(2, ' ');
                     let kind = match pieces.next().unwrap() {
@@ -139,16 +244,20 @@ where
                 })
             };
 
-            combine::dispatch!(b;
-                b'+' => status().map(Ok),
-                b':' => int().map(|i| Ok(Value::Int(i))),
-                b'$' => data().map(Ok),
-                b'*' => bulk(),
-                b'-' => error().map(Err),
-                b => combine::unexpected_any(combine::error::Token(b))
-            )
-        }
-    )))
+        combine::dispatch!(b;
+            b'+' => status(),
+            b':' => int().then_partial(move |&mut i| {
+                with_state(move |state: &mut &mut dyn RedisParser|
+                    state.int(i)
+                )
+            }),
+            b'$' => data(),
+            b'*' => bulk(),
+            b'-' => error().map(Err),
+            b => combine::unexpected_any(combine::error::Token(b))
+        )
+    }))
+}
 }
 
 #[cfg(feature = "aio")]
@@ -162,14 +271,19 @@ mod aio_support {
     #[derive(Default)]
     pub struct ValueCodec {
         state: AnySendSyncPartialState,
+        redis_state: ValueParser,
     }
 
     impl ValueCodec {
         fn decode_stream(&mut self, bytes: &mut BytesMut, eof: bool) -> RedisResult<Option<Value>> {
             let (opt, removed_len) = {
                 let buffer = &bytes[..];
-                let mut stream =
-                    combine::easy::Stream(combine::stream::MaybePartialStream(buffer, !eof));
+                let mut stream = combine::stream::state::Stream {
+                    stream: combine::easy::Stream(combine::stream::MaybePartialStream(
+                        buffer, !eof,
+                    )),
+                    state: &mut self.redis_state as &mut dyn RedisParser,
+                };
                 match combine::stream::decode_tokio(value(), &mut stream, &mut self.state) {
                     Ok(x) => x,
                     Err(err) => {
@@ -188,7 +302,10 @@ mod aio_support {
 
             bytes.advance(removed_len);
             match opt {
-                Some(result) => Ok(Some(result?)),
+                Some(result) => Ok(Some({
+                    result?;
+                    self.redis_state.take()
+                })),
                 None => Ok(None),
             }
         }
@@ -223,8 +340,12 @@ mod aio_support {
     where
         R: AsyncRead + std::marker::Unpin,
     {
+        let mut state = ValueParser::default();
         let result = combine::decode_tokio!(*decoder, *read, value(), |input, _| {
-            combine::stream::easy::Stream::from(input)
+            combine::stream::state::Stream {
+                stream: combine::stream::easy::Stream::from(input),
+                state: &mut state as &mut dyn RedisParser,
+            }
         });
         match result {
             Err(err) => Err(match err {
@@ -241,7 +362,10 @@ mod aio_support {
                     }
                 }
             }),
-            Ok(result) => result,
+            Ok(result) => {
+                result?;
+                Ok(state.take())
+            }
         }
     }
 }
@@ -281,8 +405,12 @@ impl Parser {
     /// Parses synchronously into a single value from the reader.
     pub fn parse_value<T: Read>(&mut self, mut reader: T) -> RedisResult<Value> {
         let mut decoder = &mut self.decoder;
+        let mut state = ValueParser::default();
         let result = combine::decode!(decoder, reader, value(), |input, _| {
-            combine::stream::easy::Stream::from(input)
+            combine::stream::state::Stream {
+                stream: combine::stream::easy::Stream::from(input),
+                state: &mut state as &mut dyn RedisParser,
+            }
         });
         match result {
             Err(err) => Err(match err {
@@ -299,7 +427,10 @@ impl Parser {
                     }
                 }
             }),
-            Ok(result) => result,
+            Ok(result) => {
+                result?;
+                Ok(state.take())
+            }
         }
     }
 }
