@@ -1,8 +1,9 @@
 // can't use rustfmt here because it screws up the file.
 #![cfg_attr(rustfmt, rustfmt_skip)]
-use types::{FromRedisValue, ToRedisArgs, RedisResult, NumericBehavior};
+use types::{FromRedisValue, ToRedisArgs, RedisResult, NumericBehavior, RedisFuture};
 use connection::{ConnectionLike, Msg, Connection};
 use cmd::{cmd, Cmd, Pipeline, Iter};
+use aio;
 
 #[cfg(feature = "geospatial")]
 use geo;
@@ -119,6 +120,17 @@ macro_rules! implement_commands {
                 c.arg(key).cursor_arg(0).arg("MATCH").arg(pattern);
                 c.iter(self)
             }
+        }
+
+        pub trait AsyncCommands : aio::ConnectionLike + Send +'static {
+            $(
+                $(#[$attr])*
+                #[inline]
+                fn $name<$($tyargs: $ty,)* RV: FromRedisValue>(
+                    self $(, $argname: $argty)*) -> RedisFuture<(Self, RV)>
+                where RV: Send + 'static,
+                    { ($body).query_async(self) }
+            )*
         }
 
         /// Implements common redis commands for pipelines.  Unlike the regular
@@ -1014,6 +1026,7 @@ pub trait PubSubCommands: Sized {
 }
 
 impl<T> Commands for T where T: ConnectionLike {}
+impl<T> AsyncCommands for T where T: aio::ConnectionLike + Send + 'static {}
 
 impl PubSubCommands for Connection {
     fn subscribe<'a, C, F, U>(&mut self, channels: C, mut func: F) -> RedisResult<U>

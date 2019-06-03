@@ -262,3 +262,22 @@ fn test_script() {
         }))
         .unwrap();
 }
+
+#[test]
+fn test_async_with_commands() {
+    use redis::AsyncCommands;
+
+    let ctx = TestContext::new();
+    let connect = ctx.async_connection();
+
+    block_on_all(connect.and_then(|con| {
+        con.set("key1", b"foo")
+            .and_then(|(con, ())| con.set("key2", "bar"))
+            .and_then(|(con, ())| con.get(&["key1", "key2"]).map(|t| t.1))
+            .then(|result| {
+                assert_eq!(result, Ok(("foo".to_string(), b"bar".to_vec())));
+                result
+            })
+    }))
+    .unwrap();
+}

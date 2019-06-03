@@ -369,7 +369,7 @@ extern crate tokio_uds;
 // public api
 pub use client::Client;
 pub use cmd::{cmd, pack_command, pipe, Cmd, Iter, Pipeline};
-pub use commands::{Commands, ControlFlow, PipelineCommands, PubSubCommands};
+pub use commands::{AsyncCommands, Commands, ControlFlow, PipelineCommands, PubSubCommands};
 pub use connection::{
     parse_redis_url, transaction, Connection, ConnectionAddr, ConnectionInfo, ConnectionLike,
     IntoConnectionInfo, Msg, PubSub,
